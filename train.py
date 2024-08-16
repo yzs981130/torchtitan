@@ -10,6 +10,10 @@ import time
 from datetime import timedelta
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
+from typing import List, Optional, Set
+from functools import partial
+from torch.distributed._tensor.experimental.attention import context_parallel
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.fx import GraphModule
 
@@ -30,16 +34,39 @@ from torchtitan.parallelisms import (
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 
 
-def get_train_context(enable_loss_parallel: bool, enable_compiled_autograd: bool):
+def get_train_context(
+    enable_loss_parallel: bool,
+    enable_compiled_autograd: bool,
+    cp_mesh: Optional[DeviceMesh],
+):
+    if cp_mesh is not None:
+        context_parallel_ctx = partial(context_parallel, mesh=cp_mesh)
+    else:
+        context_parallel_ctx = partial(context_parallel, mesh=None)
+
     @contextlib.contextmanager
-    def context():
+    def context(
+        cp_buffers: List[torch.Tensor],
+        cp_seq_dims: List[int],
+        cp_no_restore_buffers: Set[torch.Tensor],
+    ):
         with contextlib.ExitStack() as stack:
             if enable_loss_parallel:
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+
             if enable_compiled_autograd:
                 stack.enter_context(
                     torch._dynamo.utils.maybe_enable_compiled_autograd(True)
                 )
+
+            buffers = stack.enter_context(
+                context_parallel_ctx(
+                    buffers=cp_buffers,
+                    buffer_seq_dims=cp_seq_dims,
+                    no_restore_buffers=cp_no_restore_buffers,
+                )
+            )
+
             yield
 
     return context
@@ -61,6 +88,7 @@ def main(job_config: JobConfig):
     world_size = int(os.environ["WORLD_SIZE"])
     parallel_dims = ParallelDims(
         dp=job_config.training.data_parallel_degree,
+        cp=job_config.experimental.context_parallel_degree,
         tp=job_config.training.tensor_parallel_degree,
         pp=job_config.experimental.pipeline_parallel_degree,
         world_size=world_size,
@@ -233,6 +261,7 @@ def main(job_config: JobConfig):
     train_context = get_train_context(
         parallel_dims.loss_parallel_enabled,
         job_config.experimental.enable_compiled_autograd,
+        world_mesh["cp"] if parallel_dims.cp_enabled else None,
     )
 
     # variables used to keep info for metrics logging
@@ -266,18 +295,23 @@ def main(job_config: JobConfig):
             data_load_start = time.perf_counter()
             batch = next(data_iterator)
             input_ids, labels = batch
-            ntokens_since_last_log += labels.numel()
+            ntokens_since_last_log += labels.numel() // parallel_dim.cp
             data_loading_times.append(time.perf_counter() - data_load_start)
 
-            input_ids = input_ids.cuda()
-            labels = labels.cuda()
             optimizers.zero_grad()
 
-            if parallel_dims.pp_enabled:
-                # Pipeline Parallel forward / backward inside step() call
-                is_last_stage = pp_mesh.get_local_rank() == pp_mesh.size() - 1
+            with train_context(
+                cp_buffers=[input_ids, labels, model.freqs_cis],
+                cp_seq_dims=[1, 1, 0],
+                cp_no_restore_buffers={input_ids, labels},
+            ) as cp_buffers:
+                input_ids = input_ids.cuda()
+                labels = labels.cuda()
 
-                with train_context():
+                if parallel_dims.pp_enabled:
+                    # Pipeline Parallel forward / backward inside step() call
+                    is_last_stage = pp_mesh.get_local_rank() == pp_mesh.size() - 1
+
                     if pp_mesh.get_local_rank() == 0:
                         pp_schedule.step(input_ids)
                     elif is_last_stage:
@@ -286,15 +320,13 @@ def main(job_config: JobConfig):
                     else:
                         pp_schedule.step()
 
-                # accumulate losses across pipeline microbatches
-                loss = (
-                    torch.mean(torch.stack(losses))
-                    if is_last_stage
-                    else torch.Tensor([-1.0])
-                )
-            else:
-                # Non-PP forward / backward
-                with train_context():
+                    loss = (
+                        torch.mean(torch.stack(losses))
+                        if is_last_stage
+                        else torch.Tensor([-1.0])
+                    )
+                else:
+                    # Non-PP forward / backward
                     pred = model(input_ids)
                     loss = loss_fn(pred, labels)
                     # pred.shape=(bs, seq_len, vocab_size)

@@ -15,6 +15,11 @@ from torch.distributed import DeviceMesh
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed._composable.replicate import replicate
 from torch.distributed._tensor import Replicate, Shard
+
+try:
+    from torch.distributed._tensor.experimental.attention import enable_context_parallel
+except ImportError:
+    print("The PyTorch version does not include the experimental CP APIs.")
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -72,10 +77,16 @@ def parallelize_llama(
             )
         apply_compile(model)
 
-    if parallel_dims.dp_enabled:
+    if parallel_dims.dp_enabled or parallel_dims.cp_enabled:
         if parallel_dims.dp_type == "fsdp":
-            dp_mesh = world_mesh["dp"] if world_mesh.ndim > 1 else world_mesh
-            assert dp_mesh.mesh_dim_names == ("dp",), dp_mesh.mesh_dim_names
+            if parallel_dims.cp_enabled:
+                # Temporary solution to enable FSDP + CP
+                if parallel_dims.dp_enabled:
+                    dp_mesh = world_mesh["dp", "cp"]._flatten()
+                else:
+                    dp_mesh = world_mesh["cp"]
+            else:
+                dp_mesh = world_mesh["dp"]
 
             apply_fsdp(
                 model,
